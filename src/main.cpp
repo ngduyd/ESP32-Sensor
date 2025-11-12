@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include <PubSubClient.h>
 #include <esp_wifi.h>
+#include <SensirionI2cScd4x.h>
 
 #include "ConfigManager.h"
 
@@ -11,7 +12,11 @@ ConfigManager cfg;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
+SensirionI2cScd4x sensor;
+
 #define BOOT_BTN 0
+
+int16_t sensor_error = 0;
 
 bool lastState = HIGH;
 bool WifiMode = true;
@@ -364,8 +369,30 @@ void loopMQTT()
 
   if (strcmp(cfg.data.status, "online") == 0)
   {
+    bool dataReady = false;
+    uint16_t co2Concentration = 0;
+    float temperature = 0.0;
+    float relativeHumidity = 0.0;
+    uint32_t pressure = 0;
     // push data from sensors
     Serial.println("Publishing data...");
+    sensor.getDataReadyStatus(dataReady);
+    if (dataReady)
+    {
+      sensor_error = sensor.readMeasurement(co2Concentration, temperature, relativeHumidity);
+      if (sensor_error == 0)
+      {
+        Serial.printf("CO2: %d ppm, Temp: %.2f C, RH: %.2f %%\n", co2Concentration, temperature, relativeHumidity);
+        char payload[100];
+        snprintf(payload, sizeof(payload), "{\"co2\": %d, \"temperature\": %.2f, \"humidity\": %.2f}", co2Concentration, temperature, relativeHumidity);
+        mqttClient.publish("ESP32/sensor", payload);
+      }
+      else
+      {
+        Serial.print("Sensor read error: ");
+        Serial.println(sensor_error);
+      }
+    }
   }
 }
 
@@ -441,6 +468,18 @@ void setup()
   Serial.printf("SSID: %s\n", cfg.data.ssid);
   Serial.printf("PASS: %s\n", cfg.data.pass);
   Serial.printf("MQTT: %s:%d\n", cfg.data.mqttHost, cfg.data.mqttPort);
+
+  Wire.begin(8, 9);
+  sensor.begin(Wire, SCD41_I2C_ADDR_62);
+  Serial.println("Waking up sensor...");
+  delay(50);
+  sensor_error = sensor.wakeUp();
+  sensor_error = sensor.startPeriodicMeasurement();
+  if (sensor_error)
+  {
+    Serial.print("Sensor error during startup: ");
+    Serial.println(sensor_error);
+  }
 }
 
 void loop()
