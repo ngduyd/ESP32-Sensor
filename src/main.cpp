@@ -15,6 +15,8 @@ PubSubClient mqttClient(espClient);
 SensirionI2cScd4x sensor;
 
 #define BOOT_BTN 0
+#define BAT_PIN 7
+#define DIVIDER_RATIO 2.0129
 
 int16_t sensor_error = 0;
 
@@ -354,6 +356,11 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   }
 }
 
+float readBatteryVoltage() {
+  float vbat = (analogReadMilliVolts(BAT_PIN) / 1000.0f) * DIVIDER_RATIO;
+  return vbat;
+}
+
 void loopMQTT()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -375,8 +382,8 @@ void loopMQTT()
     float relativeHumidity = 0.0;
     uint32_t pressure = 0;
     // push data from sensors
-    Serial.println("Publishing data...");
     sensor.getDataReadyStatus(dataReady);
+    float vbat = readBatteryVoltage();
     if (dataReady)
     {
       sensor_error = sensor.readMeasurement(co2Concentration, temperature, relativeHumidity);
@@ -384,7 +391,8 @@ void loopMQTT()
       {
         Serial.printf("CO2: %d ppm, Temp: %.2f C, RH: %.2f %%\n", co2Concentration, temperature, relativeHumidity);
         char payload[100];
-        snprintf(payload, sizeof(payload), "{\"co2\": %d, \"temperature\": %.2f, \"humidity\": %.2f}", co2Concentration, temperature, relativeHumidity);
+        snprintf(payload, sizeof(payload), "{\"co2\": %d, \"temp\": %.2f, \"rh\": %.2f, \"vbat\": %.2f}", 
+                 co2Concentration, temperature, relativeHumidity, vbat);
         mqttClient.publish("ESP32/sensor", payload);
       }
       else
