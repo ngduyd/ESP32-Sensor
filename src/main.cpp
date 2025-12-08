@@ -4,6 +4,9 @@
 #include <PubSubClient.h>
 #include <esp_wifi.h>
 #include <SensirionI2cScd4x.h>
+#include <BH1750.h>
+#include <driver/i2s.h>
+
 
 #include "ConfigManager.h"
 
@@ -13,6 +16,15 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 SensirionI2cScd4x sensor;
+
+BH1750 lightMeter;
+
+#define SAMPLE_BUFFER_SIZE 512
+#define SAMPLE_RATE 8000
+#define I2S_MIC_CHANNEL I2S_CHANNEL_FMT_ONLY_LEFT
+#define I2S_MIC_SERIAL_CLOCK 13
+#define I2S_MIC_LEFT_RIGHT_CLOCK 12
+#define I2S_MIC_SERIAL_DATA 11
 
 #define BOOT_BTN 0
 #define BAT_PIN 7
@@ -62,6 +74,26 @@ bool gotSSID = false;
 bool gotPASS = false;
 bool gotMQTT = false;
 bool readyToConnect = false;
+
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0};
+
+// and don't mess around with this
+i2s_pin_config_t i2s_mic_pins = {
+    .bck_io_num = I2S_MIC_SERIAL_CLOCK,
+    .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SERIAL_DATA};
 
 class ServerCallbacks : public NimBLEServerCallbacks
 {
@@ -384,15 +416,24 @@ void loopMQTT()
     // push data from sensors
     sensor.getDataReadyStatus(dataReady);
     float vbat = readBatteryVoltage();
+    float lux = lightMeter.readLightLevel();
+    int32_t raw_samples[SAMPLE_BUFFER_SIZE];
+    size_t bytesRead = 0;
+    i2s_read(I2S_NUM_0, (void *)raw_samples, SAMPLE_BUFFER_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+    int32_t avg_level = 0;
+    for (size_t i = 0; i < bytesRead / sizeof(int32_t); i++)
+    {
+      avg_level += abs(raw_samples[i]);
+    }
     if (dataReady)
     {
       sensor_error = sensor.readMeasurement(co2Concentration, temperature, relativeHumidity);
       if (sensor_error == 0)
       {
-        Serial.printf("CO2: %d ppm, Temp: %.2f C, RH: %.2f %%\n", co2Concentration, temperature, relativeHumidity);
+        Serial.printf("CO2: %d ppm, Temp: %.2f C, RH: %.2f %%, Lux: %.2f lx, Mic: %.2f\n", co2Concentration, temperature, relativeHumidity, lux, (float)avg_level / (bytesRead / sizeof(int32_t)));
         char payload[100];
-        snprintf(payload, sizeof(payload), "{\"co2\": %d, \"temp\": %.2f, \"rh\": %.2f, \"vbat\": %.2f}", 
-                 co2Concentration, temperature, relativeHumidity, vbat);
+        snprintf(payload, sizeof(payload), "{\"co2\": %d, \"temp\": %.2f, \"rh\": %.2f, \"vbat\": %.2f, \"lux\": %.2f, \"mic\": %.2f}", 
+                 co2Concentration, temperature, relativeHumidity, vbat, lux, (float)avg_level / (bytesRead / sizeof(int32_t)));
         mqttClient.publish("ESP32/sensor", payload);
       }
       else
@@ -479,8 +520,12 @@ void setup()
 
   Wire.begin(8, 9);
   sensor.begin(Wire, SCD41_I2C_ADDR_62);
+  lightMeter.begin();
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
   Serial.println("Waking up sensor...");
   delay(50);
+  sensor.stopPeriodicMeasurement();
   sensor_error = sensor.wakeUp();
   sensor_error = sensor.startPeriodicMeasurement();
   if (sensor_error)
