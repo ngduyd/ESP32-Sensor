@@ -90,10 +90,12 @@ i2s_config_t i2s_config = {
 
 // and don't mess around with this
 i2s_pin_config_t i2s_mic_pins = {
+    .mck_io_num = I2S_PIN_NO_CHANGE,
     .bck_io_num = I2S_MIC_SERIAL_CLOCK,
     .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
     .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_MIC_SERIAL_DATA};
+    .data_in_num = I2S_MIC_SERIAL_DATA
+};
 
 class ServerCallbacks : public NimBLEServerCallbacks
 {
@@ -526,6 +528,7 @@ void setup()
   Serial.println("Waking up sensor...");
   delay(50);
   sensor.stopPeriodicMeasurement();
+  delay(500);
   sensor_error = sensor.wakeUp();
   sensor_error = sensor.startPeriodicMeasurement();
   if (sensor_error)
