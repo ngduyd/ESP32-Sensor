@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <BH1750.h>
-#include <NimBLEDevice.h>
 #include <PubSubClient.h>
 #include <SensirionI2cScd4x.h>
 #include <WiFi.h>
@@ -58,17 +57,9 @@ constexpr uint32_t kConnectTimeoutMs = 15000; // stop trying after 15 seconds
 constexpr uint32_t kRetryDelayMs = 1000;      // wait between status polls
 constexpr char BleDeviceName[] = "ESP32";
 
-void setupBLE();
-void stopBLE();
 void setupWiFi();
 void stopWiFi();
 void mqttCallback(char *topic, byte *payload, unsigned int length);
-
-static NimBLEServer *g_bleServer = nullptr;
-static NimBLEService *g_bleService = nullptr;
-static NimBLECharacteristic *ssidChar = nullptr;
-static NimBLECharacteristic *passChar = nullptr;
-static NimBLECharacteristic *mqttChar = nullptr;
 
 String tmpSSID;
 String tmpPASS;
@@ -99,156 +90,6 @@ i2s_pin_config_t i2s_mic_pins = {
     .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_MIC_SERIAL_DATA};
-
-class ServerCallbacks : public NimBLEServerCallbacks {
-public:
-    void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
-        Serial.printf("Connected from: %s\n", connInfo.getAddress().toString().c_str());
-        server->getAdvertising()->stop();
-    }
-    void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
-        Serial.printf("Disconnected, reason: %d\n", reason);
-        NimBLEDevice::startAdvertising();
-    }
-};
-
-static ServerCallbacks g_serverCallbacks;
-
-class ServerCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-    void onRead(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override { Serial.println("[BLE] Characteristic read"); }
-    void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
-        isBusy = true;
-        std::string value = characteristic->getValue();
-        std::string uuid = characteristic->getUUID().toString();
-        if (uuid == CHAR_SSID_UUID) {
-            tmpSSID = String(value.c_str());
-            gotSSID = true;
-        } else if (uuid == CHAR_PASS_UUID) {
-            tmpPASS = String(value.c_str());
-            gotPASS = true;
-        } else if (uuid == CHAR_MQTT_UUID) {
-            tmpMQTT = String(value.c_str());
-            gotMQTT = true;
-        }
-        if (gotSSID && gotPASS && gotMQTT) {
-            readyToConnect = true;
-            Serial.println(tmpSSID);
-            Serial.println(tmpPASS);
-            Serial.println(tmpMQTT);
-            strcpy(cfg.data.ssid, tmpSSID.c_str());
-            strcpy(cfg.data.pass, tmpPASS.c_str());
-            strcpy(cfg.data.mqttHost, tmpMQTT.c_str());
-            Serial.println("[BLE] Configuration updated, saving to NVS...");
-            cfg.save();
-            gotSSID = false;
-            gotPASS = false;
-            gotMQTT = false;
-        }
-        isBusy = false;
-    }
-};
-
-void setupBLE() {
-    Serial.println();
-    Serial.println("=== BLE setup ===");
-    NimBLEDevice::init(BleDeviceName);
-
-    g_bleServer = NimBLEDevice::createServer();
-    g_bleServer->setCallbacks(&g_serverCallbacks);
-
-    g_bleService = g_bleServer->createService("180A");
-
-    NimBLECharacteristic *devNameChar = g_bleService->createCharacteristic("2A00", NIMBLE_PROPERTY::READ);
-
-    ssidChar = g_bleService->createCharacteristic(CHAR_SSID_UUID,
-                                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-    passChar = g_bleService->createCharacteristic(CHAR_PASS_UUID,
-                                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-    mqttChar = g_bleService->createCharacteristic(CHAR_MQTT_UUID,
-                                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-
-    devNameChar->setValue(BleDeviceName);
-
-    Serial.printf("Current Config:\nSSID: %s\nPASS: %s\nMQTT Host: %s\n",
-                  cfg.data.ssid,
-                  cfg.data.pass,
-                  cfg.data.mqttHost);
-
-    ssidChar->setValue(cfg.data.ssid);
-    passChar->setValue(cfg.data.pass);
-    mqttChar->setValue(cfg.data.mqttHost);
-
-    ssidChar->setCallbacks(new ServerCharacteristicCallbacks());
-    passChar->setCallbacks(new ServerCharacteristicCallbacks());
-    mqttChar->setCallbacks(new ServerCharacteristicCallbacks());
-
-    g_bleService->start();
-
-    NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
-    advertising->setName(BleDeviceName);
-
-    advertising->addServiceUUID(g_bleService->getUUID());
-    // advertising->setScanResponse(true);
-    // advertising->setMinPreferred(0x06);
-    // advertising->setMinPreferred(0x12);
-
-    advertising->start();
-    // NimBLEDevice::startAdvertising();
-
-    Serial.println("[BLE] Advertising started");
-}
-
-void stopBLE() {
-    Serial.println("Stopping BLE safely...");
-    Serial.flush();
-
-    if (!NimBLEDevice::isInitialized()) {
-        Serial.println("BLE not initialized");
-        return;
-    }
-
-    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-    if (adv && adv->isAdvertising()) {
-        adv->stop();
-        delay(300);
-    }
-
-    if (g_bleServer && g_bleServer->getConnectedCount() > 0) {
-        std::vector<uint16_t> clients = g_bleServer->getPeerDevices();
-        Serial.printf("Found %d client(s)\n", clients.size());
-
-        for (uint16_t clientId : clients) {
-            Serial.printf("Disconnecting client %d...\n", clientId);
-            g_bleServer->disconnect(clientId);
-            delay(200);
-        }
-
-        delay(500);
-    }
-
-    if (ssidChar)
-        ssidChar->setCallbacks(nullptr);
-    if (passChar)
-        passChar->setCallbacks(nullptr);
-    if (mqttChar)
-        mqttChar->setCallbacks(nullptr);
-    if (g_bleServer)
-        g_bleServer->setCallbacks(nullptr);
-
-    delay(200);
-
-    NimBLEDevice::deinit(true);
-
-    ssidChar = nullptr;
-    passChar = nullptr;
-    mqttChar = nullptr;
-    g_bleService = nullptr;
-    g_bleServer = nullptr;
-
-    Serial.println("✅ BLE stopped successfully!");
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-    Serial.flush();
-}
 
 bool wifiConnecting = false;
 bool wifiConnected = false;
@@ -326,7 +167,7 @@ void setupMQTT() {
 void connectMQTT() {
     if (!mqttClient.connected()) {
         Serial.print("[MQTT] Connecting to MQTT broker...");
-        if (mqttClient.connect("ESP32Client", "client", "123456")) {
+        if (mqttClient.connect("ESP32Client")) {
             Serial.println("connected");
             mqttClient.subscribe("ESP32/cmd");
         } else {
@@ -458,6 +299,7 @@ void loopMQTT() {
                              (float)avg_level / (bytesRead / sizeof(int32_t)),
                              pmData.pm2_5,
                              pmData.pm10);
+                    mqttClient.publish("ESP32/sensor", payload);
                 } else {
                     Serial.print("Sensor read error: ");
                     Serial.println(sensor_error);
@@ -475,50 +317,15 @@ void stopMQTT() {
     }
 }
 
-void handlerButton() {
-    bool state = digitalRead(BOOT_BTN);
-    if (state == LOW && lastState == HIGH) {
-        delay(30);
-        if (digitalRead(BOOT_BTN) == LOW) {
-            Serial.println("Button pressed!");
-            switch (currentState) {
-            case STATE_WIFI_ACTIVE:
-                stopWiFi();
-                stopMQTT();
-                delay(1000);
-                setupBLE();
-                currentState = STATE_BLE_MODE;
-                break;
-
-            case STATE_BLE_MODE:
-                stopBLE();
-                delay(1000);
-                asyncConnectWiFi(cfg.data.ssid, cfg.data.pass);
-                setupMQTT();
-                currentState = STATE_OFFLINE;
-                strcpy(cfg.data.status, "offline");
-                cfg.save();
-                break;
-
-            case STATE_OFFLINE:
-                currentState = STATE_WIFI_ACTIVE;
-                strcpy(cfg.data.status, "online");
-                cfg.save();
-                break;
-
-            default:
-                break;
-            }
-        }
-    }
-    lastState = state;
-}
-
 void setup() {
+    strcpy(cfg.data.ssid, "wifi_phongthi");
+    strcpy(cfg.data.pass, "123456789");
+    strcpy(cfg.data.mqttHost, "");
+    cfg.data.mqttPort = 5883;
+    strcpy(cfg.data.status, "online");
+    cfg.save();
+
     delay(5000);
-    Serial.begin(115200);
-    delay(100);
-    pinMode(BOOT_BTN, INPUT_PULLUP);
     Serial.begin(115200);
     if (!cfg.load()) {
         Serial.println("⚠️ Using default config...");
@@ -549,36 +356,15 @@ void setup() {
 }
 
 void loop() {
-    handlerButton();
-    switch (currentState) {
-    case STATE_WIFI_ACTIVE:
-        asyncConnectWiFi(cfg.data.ssid, cfg.data.pass);
-        if (wifiConnected) {
-            if (!mqttClient.connected()) {
-                setupMQTT();
-                mqttClient.publish("ESP32/cmd", "online");
-                strcpy(cfg.data.status, "online");
-                cfg.save();
-            }
-            loopMQTT();
+    asyncConnectWiFi(cfg.data.ssid, cfg.data.pass);
+    if (wifiConnected) {
+        if (!mqttClient.connected()) {
+            setupMQTT();
+            mqttClient.publish("ESP32/cmd", "online");
+            strcpy(cfg.data.status, "online");
+            cfg.save();
         }
-        break;
-    case STATE_BLE_MODE:
-        // nothing to do, just wait for config via BLE
-        if (readyToConnect) {
-            stopBLE();
-            delay(1000);
-            currentState = STATE_WIFI_ACTIVE;
-            readyToConnect = false;
-        }
-        break;
-
-    case STATE_OFFLINE:
         loopMQTT();
-        break;
-
-    default:
-        break;
     }
     delay(100);
 }
