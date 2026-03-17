@@ -20,6 +20,14 @@ bool ConfigManager::load() {
         return false;
     }
 
+    size_t cfgLen = prefs.getBytesLength("cfg");
+    if (cfgLen != sizeof(ConfigData)) {
+        prefs.end();
+        Serial.println("[NVS] Config size mismatch");
+        resetToDefault();
+        return false;
+    }
+
     prefs.getBytes("cfg", &data, sizeof(ConfigData));
     prefs.end();
 
@@ -37,24 +45,30 @@ bool ConfigManager::save() {
     data.checksum = calcChecksum(data);
 
     prefs.begin(nvsNamespace, false);
-    prefs.putBytes("cfg", &data, sizeof(ConfigData));
+    size_t written = prefs.putBytes("cfg", &data, sizeof(ConfigData));
     prefs.end();
 
-    Serial.println("[NVS] Config saved successfully");
-    return true;
+    if (written == sizeof(ConfigData)) {
+        Serial.println("[NVS] Config saved successfully");
+    } else {
+        Serial.println("[NVS] Save failed");
+    }
+    return written == sizeof(ConfigData);
 }
 
 void ConfigManager::clear() {
     prefs.begin(nvsNamespace, false);
     prefs.clear();
     prefs.end();
+    resetToDefault();
     Serial.println("[NVS] Config cleared");
 }
 
 void ConfigManager::resetToDefault() {
     memset(&data, 0, sizeof(data));
-    strcpy(data.ssid, "ABC");
-    strcpy(data.pass, "12345678");
+    strcpy(data.deviceId, "");
+    strcpy(data.ssid, "");
+    strcpy(data.pass, "");
     strcpy(data.mqttHost, "192.168.1.100");
     strcpy(data.status, "online");
     data.mqttPort = 1883;

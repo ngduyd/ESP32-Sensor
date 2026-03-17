@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <SensirionI2cScd4x.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <driver/i2s.h>
 #include <esp_wifi.h>
 
@@ -12,6 +13,7 @@ ConfigManager cfg;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+WebServer setupServer(80);
 
 SensirionI2cScd4x sensor;
 
@@ -40,35 +42,9 @@ struct APM10_Data {
     bool valid;
 };
 
-enum SystemState {
-    STATE_WIFI_ACTIVE,
-    STATE_BLE_MODE,
-    STATE_OFFLINE
-};
-
-SystemState currentState = STATE_WIFI_ACTIVE;
-
-#define SERVICE_UUID "71941c3b-9666-4bef-82f0-1099e4cbc99e"
-#define CHAR_SSID_UUID "8cbda693-fde4-49df-a2e9-1fd9ef3ac3d4"
-#define CHAR_PASS_UUID "bce09c25-d280-42f0-8b67-bcf162a445b2"
-#define CHAR_MQTT_UUID "dfb28fc6-a1ce-4b71-9480-c7d68a86d544"
-
 constexpr uint32_t kConnectTimeoutMs = 15000; // stop trying after 15 seconds
 constexpr uint32_t kRetryDelayMs = 1000;      // wait between status polls
 constexpr char BleDeviceName[] = "ESP32";
-
-void setupWiFi();
-void stopWiFi();
-void mqttCallback(char *topic, byte *payload, unsigned int length);
-
-String tmpSSID;
-String tmpPASS;
-String tmpMQTT;
-
-bool gotSSID = false;
-bool gotPASS = false;
-bool gotMQTT = false;
-bool readyToConnect = false;
 
 i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -93,6 +69,178 @@ i2s_pin_config_t i2s_mic_pins = {
 
 bool wifiConnecting = false;
 bool wifiConnected = false;
+bool mqttOnlineAnnounced = false;
+bool forceProvisioningMode = false;
+String sensorTopic = "/ESP32/unknown";
+String commandTopic = "/ESP32/unknown/cmd";
+
+constexpr uint32_t kBootHoldResetMs = 3000;
+bool bootHoldArmed = false;
+uint32_t bootHoldStartMs = 0;
+
+bool hasProvisionedConfig() {
+    return strlen(cfg.data.deviceId) > 0 && strlen(cfg.data.ssid) > 0;
+}
+
+void updateTopics() {
+    sensorTopic = "/ESP32/" + String(cfg.data.deviceId);
+    commandTopic = sensorTopic + "/cmd";
+}
+
+bool parseMqttEndpoint(const String &input, char *hostOut, size_t hostOutSize, int &portOut) {
+    String endpoint = input;
+    endpoint.trim();
+    if (endpoint.length() == 0) {
+        return false;
+    }
+
+    String hostPart = endpoint;
+    int parsedPort = portOut;
+
+    int firstColon = endpoint.indexOf(':');
+    int lastColon = endpoint.lastIndexOf(':');
+    if (firstColon > 0 && firstColon == lastColon && firstColon < endpoint.length() - 1) {
+        String portPart = endpoint.substring(lastColon + 1);
+        portPart.trim();
+
+        bool allDigits = true;
+        for (size_t i = 0; i < portPart.length(); i++) {
+            if (!isDigit(portPart[i])) {
+                allDigits = false;
+                break;
+            }
+        }
+
+        if (allDigits) {
+            int maybePort = portPart.toInt();
+            if (maybePort > 0 && maybePort <= 65535) {
+                hostPart = endpoint.substring(0, lastColon);
+                hostPart.trim();
+                parsedPort = maybePort;
+            }
+        }
+    }
+
+    if (hostPart.length() == 0) {
+        return false;
+    }
+
+    strncpy(hostOut, hostPart.c_str(), hostOutSize - 1);
+    hostOut[hostOutSize - 1] = '\0';
+    portOut = parsedPort;
+    return true;
+}
+
+void handleBootButtonHoldInLoop() {
+    if (digitalRead(BOOT_BTN) == LOW) {
+        if (!bootHoldArmed) {
+            bootHoldArmed = true;
+            bootHoldStartMs = millis();
+            Serial.println("[RESET] BOOT pressed. Hold for 3 seconds to factory reset...");
+            return;
+        }
+
+        if (millis() - bootHoldStartMs >= kBootHoldResetMs) {
+            Serial.println("[RESET] Hold confirmed. Clearing saved configuration...");
+            cfg.clear();
+            delay(200);
+            Serial.println("[RESET] Restarting into provisioning mode...");
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (bootHoldArmed) {
+        Serial.println("[RESET] BOOT released before timeout.");
+        bootHoldArmed = false;
+    }
+}
+
+void startSetupPortal() {
+    const char *apName = "ESP32-Setup";
+
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_AP);
+    IPAddress apIp(192, 168, 4, 1);
+    IPAddress gateway(192, 168, 4, 1);
+    IPAddress subnet(255, 255, 255, 0);
+    WiFi.softAPConfig(apIp, gateway, subnet);
+
+    bool apStarted = WiFi.softAP(apName);
+
+    IPAddress ip = WiFi.softAPIP();
+    Serial.printf("[SETUP] AP start: %s\n", apStarted ? "OK" : "FAILED");
+    Serial.println("[SETUP] Provisioning AP started");
+    Serial.printf("[SETUP] SSID: %s\n", apName);
+    Serial.println("[SETUP] PASS: (open network)");
+    Serial.printf("[SETUP] Open http://%s\n", ip.toString().c_str());
+
+    setupServer.on("/", HTTP_GET, []() {
+        String page =
+            "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>ESP32 Setup</title></head><body>"
+            "<h2>ESP32 First Run Setup</h2>"
+            "<p>Connect to ESP32-Setup, then open 192.168.4.1</p>"
+            "<form method='POST' action='/save'>"
+            "<label>ID Number:</label><br><input name='id' maxlength='32' required><br><br>"
+            "<label>WiFi SSID:</label><br><input name='ssid' maxlength='31' required><br><br>"
+            "<label>WiFi Password:</label><br><input name='pass' maxlength='31' required><br><br>"
+            "<label>MQTT Server (IP/Host[:Port]):</label><br><input name='mqtt' maxlength='63' required><br><br>"
+            "<button type='submit'>Save</button></form>"
+            "</body></html>";
+        setupServer.send(200, "text/html", page);
+    });
+
+    setupServer.on("/save", HTTP_POST, []() {
+        if (!setupServer.hasArg("id") || !setupServer.hasArg("ssid") || !setupServer.hasArg("pass") || !setupServer.hasArg("mqtt")) {
+            setupServer.send(400, "text/plain", "Missing required fields");
+            return;
+        }
+
+        String id = setupServer.arg("id");
+        String ssid = setupServer.arg("ssid");
+        String pass = setupServer.arg("pass");
+        String mqtt = setupServer.arg("mqtt");
+
+        id.trim();
+        ssid.trim();
+        pass.trim();
+        mqtt.trim();
+
+        if (id.length() == 0 || ssid.length() == 0 || pass.length() < 8 || mqtt.length() == 0) {
+            setupServer.send(400, "text/plain", "Invalid input. Password must be at least 8 characters.");
+            return;
+        }
+
+        strncpy(cfg.data.deviceId, id.c_str(), sizeof(cfg.data.deviceId) - 1);
+        cfg.data.deviceId[sizeof(cfg.data.deviceId) - 1] = '\0';
+        strncpy(cfg.data.ssid, ssid.c_str(), sizeof(cfg.data.ssid) - 1);
+        cfg.data.ssid[sizeof(cfg.data.ssid) - 1] = '\0';
+        strncpy(cfg.data.pass, pass.c_str(), sizeof(cfg.data.pass) - 1);
+        cfg.data.pass[sizeof(cfg.data.pass) - 1] = '\0';
+        int mqttPort = 1883;
+        if (!parseMqttEndpoint(mqtt, cfg.data.mqttHost, sizeof(cfg.data.mqttHost), mqttPort)) {
+            setupServer.send(400, "text/plain", "Invalid MQTT server. Use host or host:port.");
+            return;
+        }
+        cfg.data.mqttPort = mqttPort;
+
+        if (!cfg.save()) {
+            setupServer.send(500, "text/plain", "Failed to save config");
+            return;
+        }
+
+        setupServer.send(200, "text/html", "Saved. Device will restart and connect to WiFi.");
+        delay(1000);
+        ESP.restart();
+    });
+
+    setupServer.begin();
+    while (true) {
+        setupServer.handleClient();
+        delay(10);
+    }
+}
 
 void setupWiFi() {
     Serial.println();
@@ -159,31 +307,12 @@ void asyncConnectWiFi(const char *ssid, const char *pass) {
     }
 }
 
-void setupMQTT() {
-    mqttClient.setServer(cfg.data.mqttHost, cfg.data.mqttPort);
-    mqttClient.setCallback(mqttCallback);
-}
-
-void connectMQTT() {
-    if (!mqttClient.connected()) {
-        Serial.print("[MQTT] Connecting to MQTT broker...");
-        if (mqttClient.connect("ESP32Client")) {
-            Serial.println("connected");
-            mqttClient.subscribe("ESP32/cmd");
-        } else {
-            Serial.print("failed, rc=");
-            Serial.print(mqttClient.state());
-            Serial.println(" try again in 5 seconds");
-        }
-    }
-}
-
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
     String msg;
     for (int i = 0; i < length; i++)
         msg += (char)payload[i];
     Serial.println(msg);
-    if (String(topic) == "ESP32/cmd") {
+    if (String(topic) == commandTopic) {
         if (msg == "disconnect") {
             // remove all stored wifi config and restart to BLE mode
             Serial.println("Received disconnect command via MQTT");
@@ -193,6 +322,26 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
         }
         strcpy(cfg.data.status, msg.c_str());
         cfg.save();
+    }
+}
+
+void setupMQTT() {
+    mqttClient.setServer(cfg.data.mqttHost, cfg.data.mqttPort);
+    mqttClient.setCallback(mqttCallback);
+}
+
+void connectMQTT() {
+    if (!mqttClient.connected()) {
+        String clientId = "ESP32-" + String(cfg.data.deviceId);
+        Serial.print("[MQTT] Connecting to MQTT broker...");
+        if (mqttClient.connect(clientId.c_str())) {
+            Serial.println("connected");
+            mqttClient.subscribe(commandTopic.c_str());
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" try again in 5 seconds");
+        }
     }
 }
 
@@ -299,7 +448,7 @@ void loopMQTT() {
                              (float)avg_level / (bytesRead / sizeof(int32_t)),
                              pmData.pm2_5,
                              pmData.pm10);
-                    mqttClient.publish("ESP32/sensor", payload);
+                    mqttClient.publish(sensorTopic.c_str(), payload);
                 } else {
                     Serial.print("Sensor read error: ");
                     Serial.println(sensor_error);
@@ -311,31 +460,42 @@ void loopMQTT() {
 
 void stopMQTT() {
     if (mqttClient.connected()) {
-        mqttClient.publish("ESP32/status", "offline");
+        mqttClient.publish((sensorTopic + "/status").c_str(), "offline");
         mqttClient.disconnect();
         Serial.println("MQTT disconnected");
     }
+    mqttOnlineAnnounced = false;
 }
 
 void setup() {
-    strcpy(cfg.data.ssid, "wifi_phongthi");
-    strcpy(cfg.data.pass, "123456789");
-    strcpy(cfg.data.mqttHost, "");
-    cfg.data.mqttPort = 5883;
-    strcpy(cfg.data.status, "online");
-    cfg.save();
-
-    delay(5000);
     Serial.begin(115200);
-    if (!cfg.load()) {
-        Serial.println("⚠️ Using default config...");
-        cfg.save();
-    } else {
-        Serial.println("✅ Config loaded.");
+    const uint32_t serialWaitStart = millis();
+    while (!Serial && millis() - serialWaitStart < 2500) {
+        delay(10);
     }
+    delay(100);
+    Serial.println("\n[BOOT] ESP32 starting...");
+    pinMode(BOOT_BTN, INPUT_PULLUP);
+
+    if (!cfg.load()) {
+        Serial.println("[CFG] No valid saved config");
+    } else {
+        Serial.println("[CFG] Config loaded");
+    }
+
+    if (forceProvisioningMode || !hasProvisionedConfig()) {
+        if (forceProvisioningMode) {
+            Serial.println("[CFG] Entering provisioning mode due to BOOT reset.");
+        }
+        startSetupPortal();
+    }
+
+    updateTopics();
+    Serial.printf("ID: %s\n", cfg.data.deviceId);
     Serial.printf("SSID: %s\n", cfg.data.ssid);
     Serial.printf("PASS: %s\n", cfg.data.pass);
     Serial.printf("MQTT: %s:%d\n", cfg.data.mqttHost, cfg.data.mqttPort);
+    Serial.printf("Topic: %s\n", sensorTopic.c_str());
 
     Wire.begin(8, 9);
     sensor.begin(Wire, SCD41_I2C_ADDR_62);
@@ -356,13 +516,19 @@ void setup() {
 }
 
 void loop() {
+    handleBootButtonHoldInLoop();
+
     asyncConnectWiFi(cfg.data.ssid, cfg.data.pass);
     if (wifiConnected) {
         if (!mqttClient.connected()) {
             setupMQTT();
-            mqttClient.publish("ESP32/cmd", "online");
+            connectMQTT();
+        }
+        if (mqttClient.connected() && !mqttOnlineAnnounced) {
+            mqttClient.publish((sensorTopic + "/status").c_str(), "online");
             strcpy(cfg.data.status, "online");
             cfg.save();
+            mqttOnlineAnnounced = true;
         }
         loopMQTT();
     }

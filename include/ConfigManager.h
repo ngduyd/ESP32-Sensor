@@ -3,6 +3,7 @@
 #include <Preferences.h>
 
 struct ConfigData {
+    char deviceId[33];
     char ssid[32];
     char pass[32];
     char mqttHost[64];
