@@ -71,7 +71,7 @@ bool wifiConnecting = false;
 bool wifiConnected = false;
 bool mqttOnlineAnnounced = false;
 bool forceProvisioningMode = false;
-String sensorTopic = "/ESP32/unknown";
+String sensorTopic = "/unknown";
 String commandTopic = "/ESP32/unknown/cmd";
 
 constexpr uint32_t kBootHoldResetMs = 3000;
@@ -83,7 +83,7 @@ bool hasProvisionedConfig() {
 }
 
 void updateTopics() {
-    sensorTopic = "/ESP32/" + String(cfg.data.deviceId);
+    sensorTopic = "/sensors/" + String(cfg.data.deviceId);
     commandTopic = sensorTopic + "/cmd";
 }
 
@@ -437,6 +437,7 @@ void loopMQTT() {
                                   pmData.pm10,
                                   lux,
                                   (float)avg_level / (bytesRead / sizeof(int32_t)));
+                    Serial.printf("MQTT route: %s\n", sensorTopic.c_str());
                     char payload[200];
                     snprintf(payload, sizeof(payload),
                              "{\"co2\": %d, \"temp\": %.2f, \"rh\": %.2f, \"vbat\": %.2f, \"lux\": %.2f, \"mic\": %.2f, \"pm2_5\": %d, \"pm10\": %d}",
