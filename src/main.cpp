@@ -334,7 +334,7 @@ void connectMQTT() {
     if (!mqttClient.connected()) {
         String clientId = "ESP32-" + String(cfg.data.deviceId);
         Serial.print("[MQTT] Connecting to MQTT broker...");
-        if (mqttClient.connect(clientId.c_str())) {
+        if (mqttClient.connect(clientId.c_str(), sensorTopic.c_str(), 1, true, "offline")) {
             Serial.println("connected");
             mqttClient.subscribe(commandTopic.c_str());
         } else {
@@ -461,7 +461,7 @@ void loopMQTT() {
 
 void stopMQTT() {
     if (mqttClient.connected()) {
-        mqttClient.publish((sensorTopic + "/status").c_str(), "offline");
+        mqttClient.publish(sensorTopic.c_str(), "offline", true);
         mqttClient.disconnect();
         Serial.println("MQTT disconnected");
     }
